@@ -1,0 +1,34 @@
+# мусор выполнения
+__pycache__/
+*.pyc
+*.pyo
+
+# локальный конфиг стенда: адреса и пути у каждого свои
+panel.env
+panel.env.bak*
+
+# состояние панели и резервные копии кода
+.ui-history.json
+.ui-video.json
+.ui-split.json
+.ui-split-out.json
+.ui-split-plan.json
+.ui-split.log
+.ui-doc.log
+*.bak-*
+*.bak.*
+
+# рабочие каталоги, если кто-то поставил панель внутрь репозитория
+output/
+graded/
+trainer/runs/
+trainer/photos/
+video-enh/in/
+video-enh/out/
+video-enh/logs/
+
+# редакторы и система
+.DS_Store
+*.swp
+.idea/
+.vscode/
