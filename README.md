@@ -74,6 +74,8 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 | `UI_TRANSLATOR` | `qwen3:8b` | Russian → prompt translator model |
 | `UI_VISION_MODEL` | `qwen3-vl:8b` | vision model for "what is in this picture" |
 | `UI_DISKS` | `/home` | extra disks to show: `label=path,label=path` |
+| `UI_CHAT_CTX` | `16384` | chat context window; the selector in the page overrides it |
+| `UI_CHAT_MAX_TOKENS` | `3000` | cap on answer length, so a looping model cannot run for minutes |
 | `UI_SATA_MOUNT` | empty | separate models disk, if you have one |
 | `UI_COMFY_IN_CONTAINER` | `0` | `1` — ComfyUI runs in docker and the panel may recreate it when it loses the GPU |
 
@@ -82,7 +84,7 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 | tab | what it does |
 |---|---|
 | images and video | Russian text → translation → ComfyUI; model, size, steps, seed, LoRA; region repaint; "fix hands/face", "fix by outline"; recent strip |
-| chat | talk to a local model; "draw …" goes to ComfyUI and comes back as a picture; attach an image and ask what is in it |
+| chat | talk to a local model; "draw …" goes to ComfyUI and comes back as a picture; attach an image and ask what is in it. If the model starts repeating one paragraph, the panel cuts the answer off itself |
 | style training | photos + a style name → LoRA in an external trainer, with progress and stop *(external script, not included)* |
 | video upscaling | CUDA networks, processing chunk by chunk *(external image, not included)* |
 | colour and brightness | per-frame measurement and repair of only what is broken: shadow desaturation, gamma, contrast, saturation |
@@ -134,6 +136,11 @@ Box: Xeon E5-2680 v4 (14 cores), 30 GB RAM, RTX 5060 Ti 16 GB, Ubuntu 26.10, Pyt
 
 ## Caveats
 
+- Small quantised models degenerate on long answers: they may repeat one sentence until
+  the context window fills. The panel fights this in two ways — anti-repetition sampler
+  settings (`repeat_penalty`, `repeat_last_n`, `presence_penalty`, all tunable through
+  `UI_CHAT_*`) and a loop guard that closes the stream as soon as a ten-word stretch
+  repeats four times. The answer is then cut short and says why.
 - The panel was written for one specific box and assumes one or two users on a trusted
   network. It is a tool for yourself, not a multi-user product: there is no
   authentication, so never expose the port.

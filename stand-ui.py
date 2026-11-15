@@ -94,6 +94,21 @@ CHAT_TIMEOUT = int(os.environ.get('UI_CHAT_TIMEOUT', '600'))
 CHAT_CTX = int(os.environ.get('UI_CHAT_CTX', '16384'))
 CHAT_CTX_MAX = int(os.environ.get('UI_CHAT_CTX_MAX', '65536'))
 CHAT_CTX_CHOICES = [4096, 8192, 16384, 32768, 65536]
+# Потолок на длину ответа. Без него залипшая модель молотит до конца окна:
+# 30 тыс. токенов одного и того же абзаца и минуты ожидания.
+CHAT_MAX_TOKENS = int(os.environ.get('UI_CHAT_MAX_TOKENS', '3000'))
+# Сэмплеры против вырожденных повторов. У ollama умолчания слабые (repeat_penalty
+# 1.1, repeat_last_n 64), и на длинном тексте модель уходит в цикл.
+CHAT_TEMP = float(os.environ.get('UI_CHAT_TEMP', '0.7'))
+CHAT_REPEAT_PENALTY = float(os.environ.get('UI_CHAT_REPEAT_PENALTY', '1.12'))
+CHAT_REPEAT_LAST_N = int(os.environ.get('UI_CHAT_REPEAT_LAST_N', '512'))
+CHAT_PRESENCE_PENALTY = float(os.environ.get('UI_CHAT_PRESENCE_PENALTY', '0.2'))
+CHAT_FREQUENCY_PENALTY = float(os.environ.get('UI_CHAT_FREQUENCY_PENALTY', '0'))
+CHAT_TOP_P = float(os.environ.get('UI_CHAT_TOP_P', '0.92'))
+CHAT_MIN_P = float(os.environ.get('UI_CHAT_MIN_P', '0'))
+# Сторож залипания: один и тот же шингл из N слов, встретившийся LIMIT раз, — цикл.
+CHAT_LOOP_N = int(os.environ.get('UI_CHAT_LOOP_N', '10'))
+CHAT_LOOP_LIMIT = int(os.environ.get('UI_CHAT_LOOP_LIMIT', '4'))
 
 # Рисование прямо из чата: если в вопросе просят картинку, чат не зовёт модель
 # словами, а ставит задачу в ту же очередь ComfyUI и рисует её.
@@ -248,6 +263,77 @@ def post_json(url, payload, timeout=120):
     req = urllib.request.Request(url, body, {'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+class LoopGuard:
+    """Ловит вырожденное залипание по ходу генерации.
+
+    Считаем, сколько раз встретился каждый шингл из n слов. Четвёртое
+    повторение — это уже не стиль, а цикл: дальше модель будет молотить
+    один и тот же абзац до конца окна контекста.
+    """
+
+    def __init__(self, n=10, limit=4):
+        self.n = max(4, int(n))
+        self.limit = max(2, int(limit))
+        self.words = []
+        self.count = {}
+        self.at = 0
+        self.hit = ''
+
+    def feed(self, chunk):
+        found = re.findall(r'\S+', (chunk or '').lower())
+        if not found:
+            return False
+        self.words.extend(found)
+        n = self.n
+        while self.at <= len(self.words) - n:
+            key = ' '.join(self.words[self.at:self.at + n])
+            c = self.count.get(key, 0) + 1
+            self.count[key] = c
+            self.at += 1
+            if c >= self.limit:
+                self.hit = key[:120]
+                return True
+        return False
+
+
+def ollama_chat_stream(model, messages, options, think, timeout, guard=None):
+    """Чат потоком: нужен, чтобы оборвать залипание, не дожидаясь конца.
+
+    Возвращает (текст, размышление, токенов, причина остановки). При
+    причине 'loop' соединение закрывается, и ollama прекращает генерацию.
+    """
+    payload = {'model': model, 'stream': True, 'messages': messages,
+               'think': bool(think), 'options': options}
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url=OLLAMA + '/api/chat', data=body,
+                                headers={'Content-Type': 'application/json'})
+    parts, thoughts, count, reason = [], [], 0, ''
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for line in r:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            msg = d.get('message') or {}
+            piece = msg.get('content') or ''
+            if piece:
+                parts.append(piece)
+                if guard is not None and guard.feed(piece):
+                    reason = 'loop'
+                    break
+            thought = msg.get('thinking') or ''
+            if thought:
+                thoughts.append(thought)
+            if d.get('done'):
+                count = int(d.get('eval_count') or 0)
+                reason = d.get('done_reason') or reason
+                break
+    return ''.join(parts), ''.join(thoughts), count, reason
 
 
 def all_checkpoints():
@@ -5772,10 +5858,20 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 ctx = CHAT_CTX
             ctx = max(2048, min(ctx, CHAT_CTX_MAX))
-            payload['options'] = {'num_ctx': ctx}
+            options = {'num_ctx': ctx,
+                       'num_predict': CHAT_MAX_TOKENS,
+                       'temperature': CHAT_TEMP,
+                       'repeat_penalty': CHAT_REPEAT_PENALTY,
+                       'repeat_last_n': CHAT_REPEAT_LAST_N,
+                       'presence_penalty': CHAT_PRESENCE_PENALTY,
+                       'frequency_penalty': CHAT_FREQUENCY_PENALTY,
+                       'top_p': CHAT_TOP_P,
+                       'min_p': CHAT_MIN_P}
             t0 = time.time()
+            guard = LoopGuard(CHAT_LOOP_N, CHAT_LOOP_LIMIT)
             try:
-                r = post_json(OLLAMA + '/api/chat', payload, timeout=CHAT_TIMEOUT)
+                text, thinking, tokens, stopped = ollama_chat_stream(
+                    model, msgs, options, payload.get('think'), CHAT_TIMEOUT, guard)
             except urllib.error.HTTPError as e:
                 try:
                     body = e.read().decode('utf-8', 'replace')[:300]
@@ -5784,11 +5880,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {'error': 'ollama отказал: %s %s' % (e.code, body)})
             except Exception as e:
                 return self._send(502, {'error': 'ollama не ответил: %s' % e})
-            msg = r.get('message') or {}
-            return self._send(200, {'text': msg.get('content') or '',
-                                    'thinking': msg.get('thinking') or '',
-                                    'model': r.get('model') or model,
-                                    'ctx': ctx,
+            note = ''
+            if stopped == 'loop':
+                tail = ' '.join(guard.hit.split(' ')[:6])
+                note = ('\n\n_обрезал: модель начала повторять одно и то же '
+                        '(«%s…»). Скажите «короче» или смените тему._' % tail)
+            elif stopped == 'length':
+                note = ('\n\n_обрезал по потолку %d токенов — попросите продолжение, '
+                        'если нужно длиннее._' % CHAT_MAX_TOKENS)
+            return self._send(200, {'text': (text + note), 'thinking': thinking,
+                                    'model': model, 'ctx': ctx, 'tokens': tokens,
+                                    'stopped': stopped or 'stop',
                                     'sec': round(time.time() - t0, 1)})
 
         if path == '/api/generate':
