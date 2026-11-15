@@ -17,6 +17,17 @@ page, JSON in between. The optional `psutil` is needed only for the hardware tab
 A real screenshot from the box the panel was written for: Russian prompt in the field,
 translation and model on the right, the recent strip below (test generations only).
 
+All eight tabs on one sheet — [docs/tabs.jpg](docs/tabs.jpg):
+
+![all panel tabs](docs/tabs.jpg)
+
+The shots were taken on that box: the page came from the very `stand-ui` running on
+`127.0.0.1:8288`, the numbers from its own JSON. Nothing was drawn in by hand.
+
+The hardware tab up close — temperatures, watts, space on both disks:
+
+![hardware tab](docs/hardware.jpg)
+
 ## What you need
 
 - Linux, Python 3.10+ (tested on 3.12 and 3.14);
@@ -83,7 +94,8 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 
 | tab | what it does |
 |---|---|
-| images and video | Russian text → translation → ComfyUI; model, size, steps, seed, LoRA; region repaint; "fix hands/face", "fix by outline"; recent strip |
+| images and video | Russian text → translation → ComfyUI; model, size, steps, seed, LoRA; video models (LTXV 2B, Wan 2.2 5B, including first+last frame) render a 2–5 s clip; region repaint; "fix hands/face", "fix by outline"; recent strip |
+| what is in the picture | drop a photo → a vision model describes the frame: in Russian as words, in English as a ready SDXL prompt; one button sends it to the drawing field |
 | chat | talk to a local model; "draw …" goes to ComfyUI and comes back as a picture; attach an image and ask what is in it. If the model starts repeating one paragraph, the panel cuts the answer off itself |
 | style training | photos + a style name → LoRA in an external trainer, with progress and stop *(external script, not included)* |
 | video upscaling | CUDA networks, processing chunk by chunk *(external image, not included)* |
@@ -102,9 +114,11 @@ The panel is an HTTP server; the browser gets one page, data travels as JSON.
 ```
 GET  /api/config     models, sizes, modes, hints
 GET  /api/history    recent strip
-POST /api/generate   {prompt, model, size, steps, seed, lora, lora_w}
+POST /api/generate   {prompt, model, size, steps, seed, lora, lora_w,
+                     length, fps, start_image, end_image}   # video models
 POST /api/inpaint    repaint a region
-POST /api/detail     fix hands/face/outline
+POST /api/redraw     repaint the whole frame by outline/depth/pose/lines/tile
+POST /api/detail     fix hands/face (hand/face detectors + ControlNet)
 POST /api/chat       {model, messages, think, draw}
 POST /api/train/*    style training
 POST /api/video/*    video upscaling
