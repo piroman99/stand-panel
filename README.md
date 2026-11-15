@@ -12,6 +12,11 @@ page, JSON in between. The optional `psutil` is needed only for the hardware tab
 
 *Русская версия: [README.ru.md](README.ru.md).*
 
+![stand-panel](docs/screenshot.jpg)
+
+A real screenshot from the box the panel was written for: Russian prompt in the field,
+translation and model on the right, the recent strip below (test generations only).
+
 ## What you need
 
 - Linux, Python 3.10+ (tested on 3.12 and 3.14);
