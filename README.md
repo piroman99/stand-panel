@@ -101,7 +101,7 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 | video upscaling | CUDA networks, processing chunk by chunk *(external image, not included)* |
 | colour and brightness | per-frame measurement and repair of only what is broken: shadow desaturation, gamma, contrast, saturation |
 | documents | closed base: ask questions about uploaded files *(external stack, not included)* |
-| hardware | CPU, memory, GPU and disk load (throughput and busy time), temperatures, CPU and GPU watts, disk space; refreshed every three seconds |
+| hardware | CPU, memory, GPU and disk load (throughput and busy time), temperatures, CPU and GPU watts, disk space; "up / down" buttons for ComfyUI and ollama (own services only); refreshed every three seconds |
 
 `stand_guard.py` is a prompt filter: it refuses to draw minors in a sexual context. It
 checks both the Russian text and the translation, because the translator can add a word
@@ -124,6 +124,24 @@ browser at 1400, 1200, 960, 760 and 420 px wide — no horizontal scroll inside 
 conversation in any case, even for a 270-character word with no spaces. Wrapping is
 visual only: copied text and commands from a code block stay in one piece.
 
+## Service buttons
+
+The hardware tab has two rows — ComfyUI and ollama — each with "up" and "down". The
+panel shows the state itself: pid, free VRAM, which model is loaded and whether the whole
+of it sits on the GPU; refreshed every three seconds.
+
+The buttons touch your own services only:
+
+- without docker (`UI_COMFY_IN_CONTAINER=0`): ComfyUI is started by the script in
+  `UI_COMFY_START` (default `~/comfy_start.sh`) and stopped by pid — only processes of
+  the same user, a foreign process is never touched; ollama is a `systemctl --user`
+  unit, `UI_OLLAMA_UNIT` (default `ollama`);
+- in docker mode: `docker compose up -d comfyui`, `docker kill comfyui`,
+  `docker start/stop ollama`.
+
+If there is nothing to start (no script) or systemd is out of reach (the panel was not
+started from its unit), the button says exactly that instead of pretending.
+
 ## API
 
 The panel is an HTTP server; the browser gets one page, data travels as JSON.
@@ -143,6 +161,8 @@ GET  /api/grade      video list and current grading parameters
 POST /api/grade/preview | /api/grade/apply
 POST /api/doc        document base control
 GET  /api/sys        hardware: CPU, memory, GPU, disks, temperatures
+GET  /api/services   whether ComfyUI and ollama are alive, what holds the GPU
+POST /api/service    {name: comfy|ollama, action: start|stop}
 ```
 
 Jobs run in the background: `GET /api/queue` and `GET /api/job/<id>`.

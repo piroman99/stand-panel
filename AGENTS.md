@@ -81,7 +81,9 @@ Expected:
 - port `8288` listening on **127.0.0.1 only**;
 - `GET /` → `HTTP 200`;
 - `GET /api/config` → non-empty `models`, `sizes`, `video_models`;
-- `GET /api/sys` → `cpu`, `mem`, `gpu` (when there is a GPU).
+- `GET /api/sys` → `cpu`, `mem`, `gpu` (when there is a GPU);
+- `GET /api/services` → `comfy` and `ollama` with `up: false/true` (the panel only
+  manages services owned by its own user).
 
 Useful checks for the report to the user:
 

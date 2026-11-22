@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -488,6 +489,259 @@ def wait_comfy_ready(wait=120):
 
 
 COMFY_IN_CONTAINER = os.environ.get('UI_COMFY_IN_CONTAINER', '1') != '0'
+
+# ----------------------------------------- поднять / опустить сервисы стенда
+# Кнопки на вкладке «железо». Панель трогает только СВОИ сервисы: без docker —
+# процесс под тем же юзером и юнит systemd --user, в режиме docker — контейнеры
+# этого стенда. Чужой процесс (другой uid) не гасится никогда.
+COMFY_START = os.environ.get('UI_COMFY_START', os.path.expanduser('~/comfy_start.sh'))
+OLLAMA_UNIT = os.environ.get('UI_OLLAMA_UNIT', 'ollama')
+SVC_LOCK = threading.Lock()
+
+
+def _port_of(url):
+    """Порт из адреса вида http://127.0.0.1:8188 -> 8188 (None, если не разобрать)."""
+    try:
+        host = url.split('//', 1)[-1].split('/', 1)[0]
+        if ':' in host:
+            return int(host.rsplit(':', 1)[1])
+    except Exception:
+        pass
+    return None
+
+
+COMFY_PORT = int(os.environ.get('UI_COMFY_PORT', str(_port_of(API) or 8188)))
+
+
+def _http_ok(url, timeout=4):
+    """Отвечает ли сервис по адресу: любой разобранный json = живой."""
+    try:
+        get_json(url, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _my_pids(needle, extra=None):
+    """Свои процессы (uid панели), в командной строке которых есть needle."""
+    out = []
+    me = os.getuid()
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return out
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat('/proc/' + pid).st_uid != me:
+                continue
+            with open('/proc/' + pid + '/cmdline', 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'replace')
+        except OSError:
+            continue
+        if needle in cmd and (extra is None or extra in cmd):
+            out.append(int(pid))
+    return out
+
+
+def _inode_on_port(port):
+    """inode слушающего TCP-сокета на этом порту (0A = LISTEN). 0 — никто не слушает."""
+    if not port:
+        return 0
+    want = '%04X' % port
+    for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(path) as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != '0A':
+                        continue
+                    if parts[1].rsplit(':', 1)[-1] == want:
+                        return int(parts[9])
+        except (OSError, ValueError):
+            continue
+    return 0
+
+
+def _pids_by_inode(inode):
+    """Свои процессы, у которых открыт сокет с этим inode (свой uid видно всегда)."""
+    out = []
+    if not inode:
+        return out
+    me = os.getuid()
+    target = 'socket:[%d]' % inode
+    try:
+        pids = os.listdir('/proc')
+    except OSError:
+        return out
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat('/proc/' + pid).st_uid != me:
+                continue
+            fds = os.listdir('/proc/' + pid + '/fd')
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink('/proc/%s/fd/%s' % (pid, fd)) == target:
+                    out.append(int(pid))
+                    break
+            except OSError:
+                continue
+    return out
+
+
+def comfy_pids():
+    """Пиды ComfyUI, который отвечает на адрес API этой панели (и только свои).
+
+    Главный способ — владелец слушающего сокета нужного порта: он не зависит от
+    того, что записано в panel.env. Поиск по командной строке — запасной путь
+    (порт ещё не открыт, процесс только стартовал).
+    """
+    pids = _pids_by_inode(_inode_on_port(_port_of(API)))
+    if pids:
+        return pids
+    return _my_pids('main.py', '--port %d' % COMFY_PORT)
+
+
+def services_status():
+    """Что живо и чем занята видеокарта (для кнопок на вкладке «железо»)."""
+    mode = 'docker' if COMFY_IN_CONTAINER else 'process'
+    comfy_up = _http_ok(API + '/system_stats')
+    pids = [] if COMFY_IN_CONTAINER else comfy_pids()
+    comfy = {'up': comfy_up, 'pid': pids[0] if pids else None,
+             'port': _port_of(API), 'mode': mode}
+    if comfy_up:
+        try:
+            st = get_json(API + '/system_stats', timeout=6)
+            dev = (st.get('devices') or [{}])[0]
+            comfy['vram_free'] = dev.get('vram_free')
+            comfy['vram_total'] = dev.get('vram_total')
+        except Exception:
+            pass
+    oll = {'up': _http_ok(OLLAMA + '/api/tags'), 'models': [],
+           'port': _port_of(OLLAMA), 'mode': mode}
+    if oll['up']:
+        try:
+            ps = get_json(OLLAMA + '/api/ps', timeout=6)
+            for m in ps.get('models') or []:
+                size = m.get('size') or 0
+                vram = m.get('size_vram') or 0
+                oll['models'].append({'name': m.get('name') or m.get('model'),
+                                      'size': size, 'size_vram': vram,
+                                      'on_gpu': bool(size and vram >= size * 0.9)})
+        except Exception:
+            pass
+    return {'comfy': comfy, 'ollama': oll}
+
+
+def _docker(*args, timeout=180):
+    try:
+        r = subprocess.run(['docker'] + list(args), cwd=COMPOSE_DIR,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stderr or r.stdout or '').strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def svc_comfy(action):
+    """Поднять/опустить ComfyUI. -> (ok, текст для человека)."""
+    if action == 'start':
+        if _http_ok(API + '/system_stats'):
+            return True, 'ComfyUI уже отвечает'
+        if COMFY_IN_CONTAINER:
+            rc, err = _docker('compose', 'up', '-d', 'comfyui', timeout=300)
+            return (rc == 0), ('поднимаю ComfyUI в контейнере'
+                               if rc == 0 else 'docker compose не смог: %s' % err)
+        if comfy_pids():
+            return True, 'процесс уже есть, жду ответа'
+        if not os.path.isfile(COMFY_START):
+            return False, 'нет скрипта запуска %s (переменная UI_COMFY_START)' % COMFY_START
+        try:
+            subprocess.Popen(['bash', COMFY_START], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception as e:
+            return False, 'не смог запустить ComfyUI: %s' % e
+        return True, 'запускаю ComfyUI, это ~15-20 с'
+    if COMFY_IN_CONTAINER:
+        rc, err = _docker('kill', 'comfyui')
+        if rc != 0 and 'No such container' not in err:
+            return False, 'docker kill не сработал: %s' % err
+        return True, 'ComfyUI остановлен, видеопамять свободна'
+    pids = comfy_pids()
+    if not pids:
+        if _http_ok(API + '/system_stats'):
+            return False, ('ComfyUI отвечает на %s, но процесс не мой — гасить не буду'
+                           % API)
+        return True, 'ComfyUI и так не запущен'
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if not comfy_pids():
+            return True, 'ComfyUI остановлен, видеопамять свободна'
+        time.sleep(1)
+    for pid in comfy_pids():        # не отпустил — гасим жёстко
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return True, 'ComfyUI остановлен (жёстко)'
+
+
+def _svc_hint(err):
+    """Понятная причина отказа systemctl --user вместо сырого текста."""
+    txt = err or ''
+    if 'DBUS_SESSION_BUS_ADDRESS' in txt or 'user scope bus' in txt:
+        return 'нет доступа к systemd --user (панель запущена не из юнита?)'
+    first = txt.strip().splitlines()
+    return 'systemctl --user: ' + (first[0][:200] if first else 'без текста')
+
+
+def _systemctl(*args, timeout=60):
+    try:
+        r = subprocess.run(['systemctl', '--user'] + list(args),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stderr or r.stdout or '').strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def svc_ollama(action):
+    """Поднять/опустить ollama. -> (ok, текст)."""
+    if action == 'start':
+        if _http_ok(OLLAMA + '/api/tags'):
+            return True, 'ollama уже отвечает'
+        if COMFY_IN_CONTAINER:
+            rc, err = _docker('start', 'ollama')
+            if rc != 0:
+                return False, 'docker start не сработал: %s' % err
+        else:
+            rc, err = _systemctl('start', OLLAMA_UNIT)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if _http_ok(OLLAMA + '/api/tags', timeout=2):
+                return True, 'ollama поднята'
+            time.sleep(1)
+        return False, 'ollama не поднялась' + ((': ' + _svc_hint(err)) if err else '')
+    if COMFY_IN_CONTAINER:
+        rc, err = _docker('stop', 'ollama')
+        if rc != 0 and 'No such container' not in err:
+            return False, 'docker stop не сработал: %s' % err
+        return True, 'ollama остановлена, видеопамять свободна'
+    rc, err = _systemctl('stop', OLLAMA_UNIT)
+    if rc != 0:
+        return False, 'ollama не остановилась: %s' % _svc_hint(err)
+    return True, 'ollama остановлена, видеопамять свободна'
+
 
 
 def ensure_comfy(job=None):
@@ -3367,6 +3621,13 @@ font-size:12.5px;color:var(--dim);line-height:1.65;margin-bottom:12px}
 .hwrow.warn .hwbar i{background:#e5a50a}
 .hwsub{margin-top:10px;padding-top:9px;border-top:1px solid var(--line);font-size:12.5px;color:var(--dim);line-height:1.7}
 .hwsub b{color:var(--tx);font-weight:600}
+.svcrows{display:grid;gap:7px;max-width:920px;margin-bottom:12px}
+.svcrow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+background:#14161a;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px}
+.svcname{color:var(--dim);min-width:0;overflow-wrap:anywhere}
+.svcname b{color:var(--tx);font-weight:600}
+.svcname .cpu{color:#e0b072}
+.svcbtns{display:flex;gap:8px}
 .hwkick{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-size:12px;color:var(--dim)}
 .hwspark{display:flex;gap:16px;margin-top:6px;max-width:920px}
 .hwspark>div{flex:1;min-width:0}
@@ -3712,6 +3973,23 @@ margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word
     <b>что сейчас с машиной</b><br>
     загрузка процессора, памяти, видеокарты и дисков и их температуры.
     Обновляется само, раз в три секунды.
+   </div>
+   <div class="svcrows">
+    <div class="svcrow">
+     <span class="svcname" id="svccomfy">ComfyUI: проверяю…</span>
+     <span class="svcbtns">
+      <button class="mini" id="cstart" type="button">поднять ComfyUI</button>
+      <button class="mini" id="cstop" type="button">опустить ComfyUI</button>
+     </span>
+    </div>
+    <div class="svcrow">
+     <span class="svcname" id="svcollama">ollama: проверяю…</span>
+     <span class="svcbtns">
+      <button class="mini" id="ostart" type="button">поднять ollama</button>
+      <button class="mini" id="ostop" type="button">опустить ollama</button>
+     </span>
+    </div>
+    <div class="hint" id="svcmsg">поднять и опустить можно только свои сервисы: свой процесс, свой юнит или контейнер этого стенда</div>
    </div>
    <div class="hw" id="hwbody"><span class="empty">считаю…</span></div>
    <div class="hwkick">последние 3 минуты</div>
@@ -4271,7 +4549,7 @@ function setMode(mode){
   if(vid){ loadVideo(); startVideoPoll() } else stopVideoPoll();
   if(grd){ gradeLoad() }
   if(doc){ loadDoc(); startDocPoll() } else stopDocPoll();
-  if(hw){ loadSys(); startSysPoll() } else stopSysPoll();
+  if(hw){ loadSys(); loadSvc(); startSysPoll() } else stopSysPoll();
 }
 let MDKEEP=[];
 function mdStash(h){MDKEEP.push(h);return '\u0000'+(MDKEEP.length-1)+'\u0000'}
@@ -4652,8 +4930,49 @@ $('dcopy').onclick=async()=>{
 /* --- железо: загрузка и температуры, обновляется само --- */
 let SPOLL=null;
 function stopSysPoll(){ if(SPOLL){ clearInterval(SPOLL); SPOLL=null } }
-function startSysPoll(){ stopSysPoll(); SPOLL=setInterval(loadSys,3000) }
+function startSysPoll(){ stopSysPoll(); SPOLL=setInterval(()=>{loadSys();loadSvc()},3000) }
 function hwTemp(t){ return (t===null||t===undefined)?'—':Number(t).toFixed(1)+' °C' }
+/* --- поднять / опустить сервисы: ComfyUI и ollama этого стенда --- */
+function svcVRAM(s){ if(!s) return ''; return 'видеопамять свободна '+Math.round(s/1048576)+' МБ' }
+async function loadSvc(){
+  let j=null;
+  try{ const r=await fetch('/api/services'); j=await r.json(); if(!r.ok) return }catch(e){ return }
+  const c=j.comfy||{}, o=j.ollama||{};
+  const cp=$('svccomfy'), op=$('svcollama');
+  if(cp){
+    let t=c.up? '<b>работает</b>'+(c.pid? ' · pid '+c.pid : '') : 'остановлен';
+    if(c.up&&c.vram_free!==undefined) t+=' · '+svcVRAM(c.vram_free);
+    cp.innerHTML='ComfyUI ('+(c.port||'—')+'): '+t;
+  }
+  if(op){
+    let t=o.up? '<b>работает</b>' : 'остановлен';
+    if(o.up&&o.models&&o.models.length){
+      const m=o.models[0];
+      const pct=m.size? Math.round(100*(m.size_vram||0)/m.size) : 0;
+      t+=' · '+esc(m.name)+': '+(pct>=99? 'вся на видеокарте'
+        : '<span class="cpu">'+pct+' % на видеокарте, остальное на процессоре</span>');
+    } else if(o.up){ t+=' · модель не загружена' }
+    op.innerHTML='ollama ('+(o.port||'—')+'): '+t;
+  }
+}
+async function svcGo(name, action, btn){
+  if(btn) btn.disabled=true;
+  if($('svcmsg')) $('svcmsg').textContent = (action==='start'?'поднимаю ':'опускаю ')+name+'…';
+  let j=null, err='';
+  try{
+    const r=await fetch('/api/service',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,action})});
+    j=await r.json();
+    if(!r.ok) err=j.error||('HTTP '+r.status);
+  }catch(e){ err='сервер не отвечает: '+e }
+  if(btn) btn.disabled=false;
+  if($('svcmsg')) $('svcmsg').textContent = err? ('не вышло: '+err) : (j.note||'готово');
+  loadSvc(); setTimeout(loadSys, 800);
+}
+if($('cstart')) $('cstart').onclick=()=>svcGo('comfy','start',$('cstart'));
+if($('cstop'))  $('cstop').onclick =()=>svcGo('comfy','stop', $('cstop'));
+if($('ostart')) $('ostart').onclick=()=>svcGo('ollama','start',$('ostart'));
+if($('ostop'))  $('ostop').onclick =()=>svcGo('ollama','stop', $('ostop'));
 function hwRow(label,pct,val){
   const p=(pct===null||pct===undefined)?null:Math.max(0,Math.min(100,Number(pct)||0));
   const cls=(p===null)?'':(p>=85?'warn':'');
@@ -5289,6 +5608,8 @@ class Handler(BaseHTTPRequestHandler):
             with _SYS_LOCK:
                 st['history'] = list(_SYS_HIST)
             return self._send(200, st)
+        if path == '/api/services':
+            return self._send(200, services_status())
         if path.startswith('/vg/'):
             name = urllib.parse.unquote(path[4:])
             full = os.path.join(GRADE_OUT, name)
@@ -5556,6 +5877,18 @@ class Handler(BaseHTTPRequestHandler):
                         removed += drop_file(x.get('file'))
                 save_history([])
             return self._send(200, {'ok': True, 'count': len(items), 'files': removed})
+
+        if path == '/api/service':
+            name = (req.get('name') or '').strip()
+            action = (req.get('action') or '').strip()
+            if name not in ('comfy', 'ollama') or action not in ('start', 'stop'):
+                return self._send(400, {'error': 'нужно name=comfy|ollama и action=start|stop'})
+            fn = svc_ollama if name == 'ollama' else svc_comfy
+            with SVC_LOCK:
+                ok, note = fn(action)
+            if not ok:
+                return self._send(500, {'error': note, 'status': services_status()})
+            return self._send(200, {'ok': True, 'note': note, 'status': services_status()})
 
         if path == '/api/unload':
             threading.Thread(target=unload_ollama, daemon=True).start()
