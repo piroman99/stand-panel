@@ -83,7 +83,8 @@ Expected:
 - `GET /api/config` → non-empty `models`, `sizes`, `video_models`;
 - `GET /api/sys` → `cpu`, `mem`, `gpu` (when there is a GPU);
 - `GET /api/services` → `comfy` and `ollama` with `up: false/true` (the panel only
-  manages services owned by its own user).
+  manages services owned by its own user) and `power` with `can: false/true` plus `raw`
+  (`yes`/`challenge`/`no`) and `hint` — the same answer logind gives for `CanPowerOff`;
 
 Useful checks for the report to the user:
 

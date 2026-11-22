@@ -142,6 +142,44 @@ The buttons touch your own services only:
 If there is nothing to start (no script) or systemd is out of reach (the panel was not
 started from its unit), the button says exactly that instead of pretending.
 
+### Power off
+
+A third row has one button — "power off the box". It is not always available, and the
+panel does not guess: it asks logind itself,
+
+```
+busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanPowerOff
+```
+
+- `yes` → the button is enabled and `systemctl poweroff` goes through without a password;
+- `challenge` → the button is greyed out and the line under it says why: the stock polkit
+  policy (`org.freedesktop.login1.power-off`: `allow_active=yes`, otherwise
+  `auth_admin_keep`) trusts only an **active** session at the console, and the panel is a
+  background user session, not that;
+- `no` / no answer → also greyed out, with the raw reason.
+
+The rule is one small file, exactly like the ones Ubuntu already ships in
+`/etc/polkit-1/rules.d/` (root, your own hands — the panel never asks for sudo). A ready
+copy is in `docs/polkit-poweroff.rules.example`:
+
+```js
+// /etc/polkit-1/rules.d/49-stand-panel-poweroff.rules
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user == "your-login") {      // or subject.isInGroup("sudo")
+        return polkit.Result.YES;
+    }
+});
+```
+
+No restart needed — polkit reads the rules directory on every request. Without that file
+the button stays honest and locked, and nobody can power the box off from the panel.
+
+If a job of the panel is still running, the first click only warns ("работа пропадёт") and
+asks for confirmation; the second click really shuts the box down.
+
 ## API
 
 The panel is an HTTP server; the browser gets one page, data travels as JSON.
@@ -163,6 +201,7 @@ POST /api/doc        document base control
 GET  /api/sys        hardware: CPU, memory, GPU, disks, temperatures
 GET  /api/services   whether ComfyUI and ollama are alive, what holds the GPU
 POST /api/service    {name: comfy|ollama, action: start|stop}
+POST /api/poweroff   {force?: true}  shut the box down if logind allows it
 ```
 
 Jobs run in the background: `GET /api/queue` and `GET /api/job/<id>`.

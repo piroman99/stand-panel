@@ -144,6 +144,45 @@ markdown, поэтому `<script>` из ответа модели остаёт�
 Если поднимать нечем (нет скрипта) или systemd недоступен (панель запущена не из
 юнита), кнопка так и скажет — молча ничего не делает.
 
+### Выключить станцию
+
+В третьей строке одна кнопка — «выключить станцию». Она доступна не всегда, и панель
+не угадывает, а спрашивает у самого logind:
+
+```
+busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanPowerOff
+```
+
+- `yes` → кнопка открыта, и `systemctl poweroff` пройдёт без пароля;
+- `challenge` → кнопка заперта, а строка под ней объясняет причину: штатная политика
+  polkit (`org.freedesktop.login1.power-off`: `allow_active=yes`, в остальных случаях
+  `auth_admin_keep`) доверяет только **активной** сессии за консолью, а панель — это
+  фоновая пользовательская сессия, не она;
+- `no` или молчание → тоже заперта, с голой причиной.
+
+Включается одним маленьким файлом — такими же, какие уже лежат в
+`/etc/polkit-1/rules.d/` (root, руками самого хозяина; панель sudo никогда не просит).
+Готовый образец — `docs/polkit-poweroff.rules.example`:
+
+```js
+// /etc/polkit-1/rules.d/49-stand-panel-poweroff.rules
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user == "ваш-логин") {        // или subject.isInGroup("sudo")
+        return polkit.Result.YES;
+    }
+});
+```
+
+Перезапускать ничего не надо — polkit перечитывает каталог правил на каждый запрос.
+Без этого файла кнопка остаётся честно запертой, и погасить машину из панели никто
+не может.
+
+Если задача панели ещё идёт, первый клик только предупреждает («работа пропадёт») и
+спрашивает подтверждение; второй клик гасит машину по-настоящему.
+
 ## API
 
 Панель сама по себе — HTTP-сервер; браузеру отдаётся одна страница, данные ходят JSON-ом.
@@ -165,6 +204,7 @@ POST /api/doc        управление базой документов
 GET  /api/sys        железо: процессор, память, видеокарта, диски, температуры
 GET  /api/services   живы ли ComfyUI и ollama, чем занята видеокарта
 POST /api/service    {name: comfy|ollama, action: start|stop}
+POST /api/poweroff   {force?: true}  погасить машину, если logind разрешает
 ```
 
 Задачи идут в фоне: `GET /api/queue` и `GET /api/job/<id>`.

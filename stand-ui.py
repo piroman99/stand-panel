@@ -636,7 +636,69 @@ def services_status():
                                       'on_gpu': bool(size and vram >= size * 0.9)})
         except Exception:
             pass
-    return {'comfy': comfy, 'ollama': oll}
+    return {'comfy': comfy, 'ollama': oll, 'power': power_status()}
+
+
+POWER_WHY = {
+    'yes': 'logind разрешает выключение этому пользователю без пароля',
+    'challenge': 'нужен пароль администратора: политика logind разрешает power-off '
+                 'только активной сессии за консолью, а панель такой сессией не '
+                 'является — нужен файл правила polkit (см. README)',
+    'no': 'logind отвечает «нет»: этому пользователю power-off запрещён настройками',
+}
+
+
+def power_status():
+    """Может ли панель погасить станцию без пароля — спрашиваем у logind (polkit).
+
+    Logind отдаёт одно из: yes / no / na / challenge. «challenge» значит, что
+    `systemctl poweroff` из панели упадёт с требованием авторизации, поэтому кнопка
+    в интерфейсе остаётся запертой и объясняет причину.
+    """
+    out = {'can': False, 'raw': '', 'hint': ''}
+    try:
+        r = subprocess.run(['busctl', 'call', 'org.freedesktop.login1',
+                            '/org/freedesktop/login1',
+                            'org.freedesktop.login1.Manager', 'CanPowerOff'],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        out['hint'] = 'не смог спросить logind: %s' % e
+        return out
+    m = re.search(r'"([^"]*)"', r.stdout or '')
+    raw = m.group(1) if m else ''
+    out['raw'] = raw
+    if not raw:
+        txt = ((r.stderr or '') + ' ' + (r.stdout or '')).strip()
+        out['hint'] = 'logind не ответил: %s' % (txt[:160] or 'пусто')
+        return out
+    out['can'] = (raw == 'yes')
+    out['hint'] = POWER_WHY.get(raw, 'logind говорит «%s» — гасить нельзя' % raw)
+    return out
+
+
+def power_off(force=False):
+    """Погасить станцию, если logind это разрешает. -> (ok, note, code).
+
+    code: ok | locked | busy | error — чтобы интерфейс мог показать «идёт задача,
+    всё равно гасить?» вместо сухого отказа.
+    """
+    st = power_status()
+    if not st['can']:
+        return False, 'кнопка заперта — %s' % (st['hint'] or 'logind не разрешает'), 'locked'
+    with JOBS_LOCK:
+        live = [j for j in JOBS.values() if j.get('state') in ('queued', 'running')]
+    if live and not force:
+        return (False, 'сейчас идёт %d задач(и) панели — работа пропадёт' % len(live),
+                'busy')
+    try:
+        r = subprocess.run(['systemctl', 'poweroff', '--no-ask-password'],
+                           capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, 'не смог погасить: %s' % e, 'error'
+    if r.returncode != 0:
+        first = ((r.stderr or r.stdout or '').strip().splitlines() or [''])[0]
+        return False, 'не смог погасить: %s' % (first[:200] or 'systemctl вернул ошибку'), 'error'
+    return True, 'гашу станцию: через несколько секунд связь пропадёт', 'ok'
 
 
 def _docker(*args, timeout=180):
@@ -3559,6 +3621,7 @@ button:hover{background:#2f343e}
 button.go{background:var(--acc);border-color:var(--acc);color:#0d1117;font-weight:600;width:100%;margin-top:14px;padding:11px}
 button.go:disabled{opacity:.5;cursor:default}
 button.mini{padding:5px 9px;font-size:12px}
+button.mini:disabled{opacity:.45;cursor:not-allowed}
 .hint{color:var(--dim);font-size:12px;margin-top:8px}
 details{margin-top:12px}summary{cursor:pointer;color:var(--dim);font-size:12px}
 .stage{display:flex;flex-direction:column;gap:12px}
@@ -3989,6 +4052,13 @@ margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word
       <button class="mini" id="ostop" type="button">опустить ollama</button>
      </span>
     </div>
+    <div class="svcrow">
+     <span class="svcname" id="pwrname">станция: проверяю…</span>
+     <span class="svcbtns">
+      <button class="mini" id="pwrbtn" type="button" disabled>выключить станцию</button>
+     </span>
+    </div>
+    <div class="hint" id="pwrwhy"></div>
     <div class="hint" id="svcmsg">поднять и опустить можно только свои сервисы: свой процесс, свой юнит или контейнер этого стенда</div>
    </div>
    <div class="hw" id="hwbody"><span class="empty">считаю…</span></div>
@@ -4934,6 +5004,7 @@ function startSysPoll(){ stopSysPoll(); SPOLL=setInterval(()=>{loadSys();loadSvc
 function hwTemp(t){ return (t===null||t===undefined)?'—':Number(t).toFixed(1)+' °C' }
 /* --- поднять / опустить сервисы: ComfyUI и ollama этого стенда --- */
 function svcVRAM(s){ if(!s) return ''; return 'видеопамять свободна '+Math.round(s/1048576)+' МБ' }
+let PWRMSG=0;   /* пока идёт действие, подсказку не перетираем опросом */
 async function loadSvc(){
   let j=null;
   try{ const r=await fetch('/api/services'); j=await r.json(); if(!r.ok) return }catch(e){ return }
@@ -4954,6 +5025,34 @@ async function loadSvc(){
     } else if(o.up){ t+=' · модель не загружена' }
     op.innerHTML='ollama ('+(o.port||'—')+'): '+t;
   }
+  const p=j.power||{}, pb=$('pwrbtn');
+  if(pb) pb.disabled=!p.can;
+  if($('pwrname')) $('pwrname').innerHTML='станция: '+(p.can
+    ? '<b>можно выключить</b>' : 'выключить из панели нельзя');
+  if($('pwrwhy') && Date.now()>PWRMSG) $('pwrwhy').textContent=p.hint||'';
+}
+async function pwrGo(force, btn){
+  if(btn) btn.disabled=true;
+  PWRMSG=Date.now()+8000;
+  if($('pwrwhy')) $('pwrwhy').textContent='гашу станцию…';
+  let j=null, err='', code='';
+  try{
+    const r=await fetch('/api/poweroff',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({force:!!force})});
+    j=await r.json();
+    if(!r.ok){ err=j.error||('HTTP '+r.status); code=j.code||'' }
+  }catch(e){ err='сервер не отвечает: '+e }
+  if(err){
+    if(btn) btn.disabled=false;
+    PWRMSG=Date.now()+8000;
+    if($('pwrwhy')) $('pwrwhy').textContent='не вышло: '+err;
+    if(code==='busy' && !force && confirm(err+String.fromCharCode(10,10)+'Всё равно выключить станцию?')){
+      return pwrGo(true, btn);
+    }
+    loadSvc(); return;
+  }
+  PWRMSG=Date.now()+8000;
+  if($('pwrwhy')) $('pwrwhy').textContent=j.note||'гашу станцию';
 }
 async function svcGo(name, action, btn){
   if(btn) btn.disabled=true;
@@ -4973,6 +5072,7 @@ if($('cstart')) $('cstart').onclick=()=>svcGo('comfy','start',$('cstart'));
 if($('cstop'))  $('cstop').onclick =()=>svcGo('comfy','stop', $('cstop'));
 if($('ostart')) $('ostart').onclick=()=>svcGo('ollama','start',$('ostart'));
 if($('ostop'))  $('ostop').onclick =()=>svcGo('ollama','stop', $('ostop'));
+if($('pwrbtn')) $('pwrbtn').onclick=()=>pwrGo(false, $('pwrbtn'));
 function hwRow(label,pct,val){
   const p=(pct===null||pct===undefined)?null:Math.max(0,Math.min(100,Number(pct)||0));
   const cls=(p===null)?'':(p>=85?'warn':'');
@@ -5889,6 +5989,14 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._send(500, {'error': note, 'status': services_status()})
             return self._send(200, {'ok': True, 'note': note, 'status': services_status()})
+
+        if path == '/api/poweroff':
+            ok, note, code = power_off(force=bool(req.get('force')))
+            if not ok:
+                http = {'busy': 409, 'locked': 403}.get(code, 500)
+                return self._send(http, {'error': note, 'code': code,
+                                         'power': power_status()})
+            return self._send(200, {'ok': True, 'code': code, 'note': note})
 
         if path == '/api/unload':
             threading.Thread(target=unload_ollama, daemon=True).start()

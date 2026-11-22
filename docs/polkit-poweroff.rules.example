@@ -1,0 +1,19 @@
+// Разрешает выключить машину из панели без пароля (кнопка «выключить станцию»).
+//
+// Куда положить: /etc/polkit-1/rules.d/49-stand-panel-poweroff.rules   (root)
+// Перезапускать polkit не надо — каталог правил читается на каждый запрос.
+// Проверка после установки:
+//   busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+//           org.freedesktop.login1.Manager CanPowerOff
+//   → s "yes"  — кнопка в панели откроется (опрос идёт раз в три секунды).
+//
+// Замените "your-login" на свой логин. Строка с группой — альтернатива:
+// разрешить всем из группы sudo. Не ставьте оба условия сразу, если не нужно.
+
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user == "your-login") {
+        return polkit.Result.YES;
+    }
+});
