@@ -3381,6 +3381,28 @@ height:52vh;overflow:auto;font-size:13.5px;white-space:pre-wrap;word-break:break
 .log details{margin-top:6px;color:var(--dim);font-size:12px}
 .log img{max-width:100%;border-radius:8px;margin-top:8px;display:block;cursor:zoom-in}
 .log .ph{color:var(--dim);font-size:12px;margin-top:6px}
+.log .md{white-space:normal;min-width:0;overflow-wrap:anywhere;word-break:break-word;hyphens:none}
+.log .md p{margin:0 0 8px}
+.log .md p:last-child{margin-bottom:0}
+.log .md p,.log .md li,.log .md td,.log .md th,.log .md blockquote,
+.log .md code{white-space:normal;overflow-wrap:anywhere;word-break:break-word;hyphens:none}
+.log .md h3,.log .md h4,.log .md h5,.log .md h6{margin:10px 0 6px;font-size:15px;font-weight:600;color:#e6edf3}
+.log .md h3{font-size:16px}
+.log .md ul,.log .md ol{margin:0 0 8px;padding-left:22px}
+.log .md li{margin:2px 0}
+.log .md b{color:var(--tx);margin-right:0;font-weight:600}
+.log .md i{color:var(--tx)}
+.log .md code{background:#242830;border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+font-family:ui-monospace,'DejaVu Sans Mono',monospace;font-size:12.5px;color:#ffd28a}
+.log .md pre{background:#0f1115;border:1px solid var(--line);border-radius:8px;padding:9px 11px;
+margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.log .md pre code{background:none;border:0;padding:0;color:#d7e2ee;font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.log .md blockquote{border-left:3px solid var(--acc);margin:0 0 8px;padding:2px 0 2px 10px;color:var(--dim)}
+.log .md table{border-collapse:collapse;margin:0 0 8px;font-size:12.5px}
+.log .md th,.log .md td{border:1px solid var(--line);padding:4px 8px;text-align:left}
+.log .md th{background:#20242c;color:#e6edf3}
+.log .md a{color:#79b8ff}
+.log .md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
 </style></head><body>
 <div class="wrap">
  <div class="head">
@@ -4251,12 +4273,60 @@ function setMode(mode){
   if(doc){ loadDoc(); startDocPoll() } else stopDocPoll();
   if(hw){ loadSys(); startSysPoll() } else stopSysPoll();
 }
+let MDKEEP=[];
+function mdStash(h){MDKEEP.push(h);return '\u0000'+(MDKEEP.length-1)+'\u0000'}
+function mdInline(s){
+  s=s.replace(/`([^`\n]+)`/g,(m,c)=>mdStash('<code>'+c+'</code>'));
+  s=s.replace(/\*\*([^*\n]+?)\*\*/g,'<b>$1</b>');
+  s=s.replace(/__([^_\n]+?)__/g,'<b>$1</b>');
+  s=s.replace(/(^|[\s(*])\*([^*\n]+?)\*(?!\*)/g,'$1<i>$2</i>');
+  s=s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+function mdToHtml(src){
+  MDKEEP=[];
+  let s=esc(src||'').replace(/\r\n/g,'\n');
+  s=s.replace(/```[ \t]*([\w+#.\-]*)[ \t]*\n([\s\S]*?)```/g,(m,l,c)=>mdStash('<pre><code>'+c.replace(/\n+$/,'')+'</code></pre>'));
+  s=s.replace(/```[ \t]*([\w+#.\-]*)[ \t]*\n([\s\S]*)$/,(m,l,c)=>mdStash('<pre><code>'+c.replace(/\n+$/,'')+'</code></pre>'));
+  s=s.replace(/```([\s\S]*?)```/g,(m,c)=>mdStash('<pre><code>'+c.replace(/\n+$/,'')+'</code></pre>'));
+  const lines=s.split('\n'), out=[];
+  let para=[], list='', i=0, m=null;
+  const flush=()=>{ if(para.length){ out.push('<p>'+mdInline(para.join('\n').replace(/\n/g,'<br>'))+'</p>'); para=[] } };
+  const closeList=()=>{ if(list){ out.push('</'+list+'>'); list='' } };
+  const isSep=ln=>/^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(ln)&&/-/.test(ln);
+  const cells=r=>r.replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(x=>x.trim());
+  while(i<lines.length){
+    const ln=lines[i], t=ln.trim();
+    if(!t){ flush(); closeList(); i++; continue }
+    if(/^\u0000\d+\u0000$/.test(t)){ flush(); closeList(); out.push(t); i++; continue }
+    if(m=t.match(/^(#{1,6})\s+(.*)$/)){ flush(); closeList();
+      const n=Math.min(m[1].length+2,6); out.push('<h'+n+'>'+mdInline(m[2])+'</h'+n+'>'); i++; continue }
+    if(/^([-*_])\1{2,}$/.test(t)){ flush(); closeList(); out.push('<hr>'); i++; continue }
+    if(t.startsWith('&gt;')){ flush(); closeList(); const q=[];
+      while(i<lines.length && lines[i].trim().startsWith('&gt;')){ q.push(lines[i].trim().replace(/^&gt;\s?/,'')); i++ }
+      out.push('<blockquote>'+mdInline(q.join(' '))+'</blockquote>'); continue }
+    if(t.includes('|') && i+1<lines.length && isSep(lines[i+1])){
+      flush(); closeList();
+      const head=cells(lines[i]); i+=2; let body='';
+      while(i<lines.length && lines[i].trim() && lines[i].includes('|')){
+        body+='<tr>'+cells(lines[i]).map(x=>'<td>'+mdInline(x)+'</td>').join('')+'</tr>'; i++ }
+      out.push('<table><thead><tr>'+head.map(x=>'<th>'+mdInline(x)+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table>');
+      continue }
+    if(m=t.match(/^[-*+]\s+(.*)$/)){ flush(); if(list!=='ul'){ closeList(); out.push('<ul>'); list='ul' }
+      out.push('<li>'+mdInline(m[1])+'</li>'); i++; continue }
+    if(m=t.match(/^\d+[.)]\s+(.*)$/)){ flush(); if(list!=='ol'){ closeList(); out.push('<ol>'); list='ol' }
+      out.push('<li>'+mdInline(m[1])+'</li>'); i++; continue }
+    para.push(ln); i++;
+  }
+  flush(); closeList();
+  return out.join('').replace(/\u0000(\d+)\u0000/g,(mm,n)=>MDKEEP[n]||'');
+}
 function renderChat(){
   const box=$('clog');
   if(!CHAT.length){ box.innerHTML='<span class="empty">здесь будет ответ</span>'; return }
   box.innerHTML=CHAT.map(m=>m.role==='user'
     ? `<div class="u"><b>вы:</b>${esc(m.content)}</div>`
-    : `<div class="a"><b>${esc(m.model||'модель')}:</b>${esc(m.content)}${m.image?`<img src="/img/${encodeURI(m.image)}" alt="" onclick="window.open(this.src,'_blank')">`:''}${m.pending?`<div class="ph">${esc(m.pending)}</div>`:''}${m.thinking?`<details><summary>ход мысли</summary>${esc(m.thinking)}</details>`:''}</div>`
+    : `<div class="a"><b>${esc(m.model||'модель')}:</b><div class="md">${mdToHtml(m.content)}</div>${m.image?`<img src="/img/${encodeURI(m.image)}" alt="" onclick="window.open(this.src,'_blank')">`:''}${m.pending?`<div class="ph">${esc(m.pending)}</div>`:''}${m.thinking?`<details><summary>ход мысли</summary>${esc(m.thinking)}</details>`:''}</div>`
   ).join('');
   box.scrollTop=box.scrollHeight;
 }

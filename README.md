@@ -96,7 +96,7 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 |---|---|
 | images and video | Russian text → translation → ComfyUI; model, size, steps, seed, LoRA; video models (LTXV 2B, Wan 2.2 5B, including first+last frame) render a 2–5 s clip; region repaint; "fix hands/face", "fix by outline"; recent strip |
 | what is in the picture | drop a photo → a vision model describes the frame: in Russian as words, in English as a ready SDXL prompt; one button sends it to the drawing field |
-| chat | talk to a local model; "draw …" goes to ComfyUI and comes back as a picture; attach an image and ask what is in it. If the model starts repeating one paragraph, the panel cuts the answer off itself |
+| chat | talk to a local model; answers come back formatted (markdown: tables, lists, code blocks) with long lines wrapped by words; "draw …" goes to ComfyUI and comes back as a picture; attach an image and ask what is in it. If the model starts repeating one paragraph, the panel cuts the answer off itself |
 | style training | photos + a style name → LoRA in an external trainer, with progress and stop *(external script, not included)* |
 | video upscaling | CUDA networks, processing chunk by chunk *(external image, not included)* |
 | colour and brightness | per-frame measurement and repair of only what is broken: shadow desaturation, gamma, contrast, saturation |
@@ -106,6 +106,23 @@ Everything machine-specific lives in `panel.env` next to the code (template:
 `stand_guard.py` is a prompt filter: it refuses to draw minors in a sexual context. It
 checks both the Russian text and the translation, because the translator can add a word
 the source never had. Without it the panel refuses to draw at all.
+
+## Chat: formatting and wrapping
+
+Model answers are rendered as markdown: headings, bold and italic, inline `code`,
+fenced code blocks, lists, tables, quotes, links, rules. Your own messages stay plain
+text — exactly what you typed.
+
+![model answer with a table and a code block](docs/chat-markdown.jpg)
+
+The renderer is about 60 lines of plain JS inside the page: no CDN, no library. Order
+matters — the text is escaped first and only then parsed as markdown, so a `<script>`
+inside a model answer stays text (checked: zero `script` nodes in the output HTML).
+
+Long lines wrap by words: prose, code blocks and table cells alike. Checked in a
+browser at 1400, 1200, 960, 760 and 420 px wide — no horizontal scroll inside the
+conversation in any case, even for a 270-character word with no spaces. Wrapping is
+visual only: copied text and commands from a code block stay in one piece.
 
 ## API
 
